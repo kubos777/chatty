@@ -30,7 +30,18 @@ export const ChatHeader = ({ roomName, roomType, onlineCount, isConnected, onTog
                     </div>
                 </div>
             </div>
-
+            <button
+                onClick={() => {
+                    const audio = new AudioContext()
+                    const osc = audio.createOscillator()
+                    osc.connect(audio.destination)
+                    osc.start()
+                    osc.stop(audio.currentTime + 0.2)
+                }}
+                className="text-sm bg-gray-200 px-2 py-1 rounded"
+            >
+                Test Sound
+            </button>
             <div className="flex items-center space-x-2">
                 <div className={`flex items-center space-x-2 px-3 py-1 rounded-full ${
                     isConnected ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'

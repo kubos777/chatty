@@ -1,16 +1,15 @@
-// frontend/src/hooks/useSocket.ts
 import {useEffect, useRef, useState} from 'react'
 import { io, Socket } from 'socket.io-client'
 import toast from 'react-hot-toast'
-import {useNotifications} from "./useNotifications.ts";
+import {useNotifications} from "./useNotifications.ts"
 
 interface Message {
     id: string
     message: string
     username: string
-    room_id: string
+    room_id: number  // Cambiar a number
     timestamp: string
-    type?: string
+    roomType?: 'public' | 'dm'  // Agregar esta propiedad
 }
 
 interface User {
@@ -32,8 +31,7 @@ interface DM {
 
 export const useSocket = (token: string | null) => {
     const [socket, setSocket] = useState<Socket | null>(null)
-    const [messages, setMessages] = useState<Message[]>([])
-    const [dmMessages, setDmMessages] = useState<Record<number, Message[]>>({})
+    const [allMessages, setAllMessages] = useState<Message[]>([])
     const [dms, setDms] = useState<DM[]>([])
     const [currentRoom, setCurrentRoom] = useState<{ id: number, type: 'public' | 'dm' }>({ id: 1, type: 'public' })
     const [onlineUsers, setOnlineUsers] = useState<Array<{username: string, status: string}>>([])
@@ -45,25 +43,22 @@ export const useSocket = (token: string | null) => {
     const currentRoomRef = useRef(currentRoom)
     const { notifyNewMessage } = useNotifications()
 
-    // Load DMs when authenticated
+    useEffect(() => {
+        currentRoomRef.current = currentRoom
+    }, [currentRoom])
+
     useEffect(() => {
         if (isAuthenticated && token) {
             loadDMs()
         }
     }, [isAuthenticated, token])
 
-    useEffect(() => {
-        currentRoomRef.current = currentRoom
-    }, [currentRoom])
-
     const loadDMs = async () => {
         if (!token) return
 
         try {
             const response = await fetch('http://localhost:8000/dms', {
-                headers: {
-                    'Authorization': `Bearer ${token}`
-                }
+                headers: { 'Authorization': `Bearer ${token}` }
             })
             const data = await response.json()
             setDms(data.dms || [])
@@ -72,7 +67,7 @@ export const useSocket = (token: string | null) => {
         }
     }
 
-    const loadRoomMessages = async (roomId: number) => {
+    const loadRoomMessages = async (roomId: number, roomType: 'public' | 'dm') => {
         if (!token) return
 
         try {
@@ -81,19 +76,22 @@ export const useSocket = (token: string | null) => {
             })
             const data = await response.json()
 
-            // Actualizar según el tipo de room actual
-            if (currentRoomRef.current.type === 'dm') {
-                setDmMessages(prev => ({
-                    ...prev,
-                    [roomId]: data.messages
-                }))
-            } else {
-                setMessages(data.messages)
-            }
+            // Agregar los mensajes al allMessages con el roomType correcto
+            const messagesWithType = data.messages.map((msg: Message) => ({
+                ...msg,
+                roomType
+            }))
+
+            setAllMessages(prev => {
+                // Remover mensajes viejos de este room
+                const filtered = prev.filter(m => m.room_id !== roomId)
+                return [...filtered, ...messagesWithType]
+            })
         } catch (error) {
             console.error('Error loading messages:', error)
         }
     }
+
     useEffect(() => {
         if (token) {
             const newSocket = io('http://localhost:8000')
@@ -113,6 +111,8 @@ export const useSocket = (token: string | null) => {
                 setIsAuthenticated(true)
                 toast.success(`Welcome back, ${data.user.username}!`)
                 newSocket.emit('join_room', { room_id: 1 })
+                // Cargar mensajes del room público inicial
+                loadRoomMessages(1, 'public')
             })
 
             newSocket.on('auth_error', (data) => {
@@ -124,10 +124,10 @@ export const useSocket = (token: string | null) => {
             })
 
             newSocket.on('new_message', (data) => {
-                if (currentRoom.type === 'public' && data.room_id === currentRoom.id) {
-                    setMessages(prev => [...prev, data])
-                }
-                if (currentRoomRef.current.type !== 'public' || data.room_id !== currentRoomRef.current.id) {
+                setAllMessages(prev => [...prev, { ...data, roomType: 'public' as const }])
+
+                // Notificar si no estás en ese room
+                if (currentRoomRef.current.type !== 'public' || currentRoomRef.current.id !== data.room_id) {
                     notifyNewMessage(data.username, data.message, false)
                 }
             })
@@ -135,9 +135,7 @@ export const useSocket = (token: string | null) => {
             newSocket.on('dm_created', (data) => {
                 toast.success(`DM with ${data.with_user} created!`)
 
-                // Agregar el DM a la lista
                 setDms(prev => {
-                    // Evitar duplicados
                     const exists = prev.some(dm => dm.id === data.id)
                     if (exists) return prev
 
@@ -151,19 +149,18 @@ export const useSocket = (token: string | null) => {
                     }]
                 })
 
-                // Cambiar automáticamente a ese DM
+                // Cambiar a ese DM y cargar mensajes
                 setCurrentRoom({ id: data.id, type: 'dm' })
-                loadRoomMessages(data.id)
+                loadRoomMessages(data.id, 'dm')
             })
 
             newSocket.on('new_dm_message', (data) => {
-                setDmMessages(prev => ({
-                    ...prev,
-                    [data.room_id]: [...(prev[data.room_id] || []), data]
-                }))
+                setAllMessages(prev => [...prev, { ...data, roomType: 'dm' as const }])
 
-                if (currentRoomRef.current.type !== 'dm' || data.room_id !== currentRoomRef.current.id) {
+                // Notificar si no estás en ese DM
+                if (currentRoomRef.current.type !== 'dm' || currentRoomRef.current.id !== data.room_id) {
                     notifyNewMessage(data.username, data.message, true)
+
                     setDms(prev => prev.map(dm =>
                         dm.id === data.room_id
                             ? { ...dm, unread_count: (dm.unread_count || 0) + 1, last_message: data.message }
@@ -203,7 +200,7 @@ export const useSocket = (token: string | null) => {
         }
     }
 
-    const switchToRoom = async (roomId: number, type: 'public' | 'dm') => {
+    const switchToRoom = (roomId: number, type: 'public' | 'dm') => {
         setCurrentRoom({ id: roomId, type })
 
         // Limpiar unread
@@ -213,20 +210,25 @@ export const useSocket = (token: string | null) => {
             ))
         }
 
-        // Cargar mensajes
-        await loadRoomMessages(roomId)
+        // Cargar mensajes si no están en memoria
+        const hasMessages = allMessages.some(m => m.room_id === roomId && m.roomType === type)
+        if (!hasMessages) {
+            loadRoomMessages(roomId, type)
+        }
 
-        if (socket) {
-            if (type === 'public') {
-                socket.emit('join_room', { room_id: roomId })
-            }
+        if (socket && type === 'public') {
+            socket.emit('join_room', { room_id: roomId })
         }
     }
 
+    // Filtrar mensajes según el room actual
+    const currentMessages = allMessages.filter(m =>
+        m.room_id === currentRoom.id && m.roomType === currentRoom.type
+    )
 
     return {
         socket,
-        messages: currentRoom.type === 'dm' ? (dmMessages[currentRoom.id] || []) : messages,
+        messages: currentMessages,
         dms,
         currentRoom,
         onlineUsers,

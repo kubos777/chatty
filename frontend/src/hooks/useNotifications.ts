@@ -1,66 +1,67 @@
-import { useEffect, useRef } from 'react'
+import { useEffect } from 'react'
 
 export const useNotifications = () => {
-    const audioRef = useRef<HTMLAudioElement | null>(null)
-
     useEffect(() => {
-        // Pedir permisos de notificación
+        // Pedir permisos al cargar
         if ('Notification' in window && Notification.permission === 'default') {
             Notification.requestPermission()
-        }
-
-        return () => {
-            if (audioRef.current) {
-                audioRef.current.pause()
-            }
         }
     }, [])
 
     const playSound = () => {
         try {
-            const context = new (window.AudioContext || (window as any).webkitAudioContext)()
-            const oscillator = context.createOscillator()
-            const gainNode = context.createGain()
+            // Crear un contexto de audio al momento de llamar
+            const AudioContext = window.AudioContext || (window as any).webkitAudioContext
+            const audioContext = new AudioContext()
+
+            const oscillator = audioContext.createOscillator()
+            const gainNode = audioContext.createGain()
 
             oscillator.connect(gainNode)
-            gainNode.connect(context.destination)
+            gainNode.connect(audioContext.destination)
 
-            oscillator.frequency.value = 800
             oscillator.type = 'sine'
+            oscillator.frequency.value = 800
 
-            gainNode.gain.setValueAtTime(0, context.currentTime)
-            gainNode.gain.linearRampToValueAtTime(0.3, context.currentTime + 0.01)
-            gainNode.gain.exponentialRampToValueAtTime(0.01, context.currentTime + 0.3)
+            gainNode.gain.setValueAtTime(0.5, audioContext.currentTime)
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5)
 
-            oscillator.start(context.currentTime)
-            oscillator.stop(context.currentTime + 0.3)
+            oscillator.start(audioContext.currentTime)
+            oscillator.stop(audioContext.currentTime + 0.5)
 
-            // Cerrar contexto después
-            setTimeout(() => context.close(), 500)
+            // Cleanup
+            setTimeout(() => audioContext.close(), 1000)
         } catch (error) {
-            console.error('Error playing sound:', error)
-        }
-    }
-
-    const showNotification = (title: string, body: string) => {
-        if ('Notification' in window && Notification.permission === 'granted') {
-            new Notification(title, {
-                body,
-                icon: '/vite.svg',
-                tag: 'chat-message',
-                requireInteraction: false
-            })
+            console.error('Audio error:', error)
         }
     }
 
     const notifyNewMessage = (username: string, message: string, isDM: boolean = false) => {
-        // Solo notificar si la ventana no tiene foco
+        // Siempre intentar reproducir sonido
+        playSound()
+
+        // Mostrar notificación si no tiene foco
         if (!document.hasFocus()) {
-            playSound()
-            showNotification(
-                isDM ? `${username} (DM)` : username,
-                message
-            )
+            if ('Notification' in window && Notification.permission === 'granted') {
+                const notification = new Notification(
+                    isDM ? `💬 ${username} (DM)` : `💬 ${username}`,
+                    {
+                        body: message.substring(0, 100),
+                        icon: '/vite.svg',
+                        badge: '/vite.svg',
+                        tag: `chat-${isDM ? 'dm' : 'public'}`,
+                        requireInteraction: false
+                    }
+                )
+
+                notification.onclick = () => {
+                    window.focus()
+                    notification.close()
+                }
+
+                // Auto-cerrar después de 4 segundos
+                setTimeout(() => notification.close(), 4000)
+            }
         }
     }
 

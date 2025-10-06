@@ -85,6 +85,11 @@ export const ChatLayout = ({
     const handleTyping = () => {
         if (socket) {
             socket.emit('typing_start', { room_id: currentRoom.id })
+
+            // Auto-stop después de 2 segundos
+            setTimeout(() => {
+                socket.emit('typing_stop', { room_id: currentRoom.id })
+            }, 2000)
         }
     }
 
