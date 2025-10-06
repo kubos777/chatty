@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 import socketio
 import uvicorn
+from sqlalchemy.future import select
 
 from database import init_db, get_db, AsyncSessionLocal
 from auth import (
@@ -133,6 +134,123 @@ async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
 @app.get("/")
 def read_root():
     return {"message": "Realtime Chat API with Auth is running!"}
+
+
+@app.get("/dms")
+async def get_user_dms(db: AsyncSession = Depends(get_db), credentials=Depends(security)):
+    """Get all DM rooms for current user"""
+    token = credentials.credentials
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = int(payload.get("sub"))
+
+    result = await db.execute(
+        select(Room, RoomMembership)
+        .join(RoomMembership)
+        .where(
+            Room.room_type == 'dm',
+            RoomMembership.user_id == user_id
+        )
+    )
+
+    rooms_data = []
+    for room, membership in result.all():
+        other_members = await db.execute(
+            select(User, RoomMembership)
+            .join(RoomMembership)
+            .where(
+                RoomMembership.room_id == room.id,
+                RoomMembership.user_id != user_id
+            )
+        )
+        other_user = other_members.first()
+
+        if other_user:
+            other_user_obj, _ = other_user
+
+            # Get last message
+            last_msg = await db.execute(
+                select(Message)
+                .where(Message.room_id == room.id)
+                .order_by(Message.created_at.desc())
+                .limit(1)
+            )
+            last_message = last_msg.scalar_one_or_none()
+
+            # Count unread messages (messages after last_read_at)
+            unread_count = await db.execute(
+                select(Message)
+                .where(
+                    Message.room_id == room.id,
+                    Message.created_at > membership.last_read_at,
+                    Message.sender_id != user_id  # No contar propios mensajes
+                )
+            )
+            unread = len(unread_count.all())
+
+            rooms_data.append({
+                'id': room.id,
+                'name': room.name,
+                'type': 'dm',
+                'with_user': other_user_obj.username,
+                'with_user_id': other_user_obj.id,
+                'last_message': last_message.content if last_message else None,
+                'last_message_time': last_message.created_at.isoformat() if last_message else None,
+                'unread_count': unread
+            })
+
+    return {'dms': rooms_data}
+
+@app.get("/messages/{room_id}")
+async def get_room_messages(
+        room_id: int,
+        limit: int = 50,
+        db: AsyncSession = Depends(get_db),
+        credentials=Depends(security)
+):
+    """Get messages from a specific room"""
+    token = credentials.credentials
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user_id = int(payload.get("sub"))
+
+    # Verify user is member of the room
+    membership = await db.execute(
+        select(RoomMembership)
+        .where(
+            RoomMembership.room_id == room_id,
+            RoomMembership.user_id == user_id
+        )
+    )
+
+    if not membership.scalar_one_or_none():
+        raise HTTPException(status_code=403, detail="Not a member of this room")
+
+    # Get messages
+    result = await db.execute(
+        select(Message, User)
+        .join(User, Message.sender_id == User.id)
+        .where(Message.room_id == room_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    )
+
+    messages = []
+    for message, user in result.all():
+        messages.append({
+            'id': message.id,
+            'message': message.content,
+            'username': user.username,
+            'sender_id': user.id,
+            'room_id': message.room_id,
+            'timestamp': message.created_at.isoformat()
+        })
+
+    return {'messages': list(reversed(messages))}
 
 
 # WebSocket events
@@ -349,17 +467,13 @@ async def update_status(sid, data):
 
 @sio.event
 async def create_dm(sid, data):
-    """Create or get existing DM room between two users"""
     if sid not in connected_users:
         return
 
     target_username = data.get('target_username')
-    if not target_username:
-        return
-
     current_user = connected_users[sid]
 
-    # Find target user
+    # Buscar usuario objetivo
     target_user_data = None
     for user_data in connected_users.values():
         if user_data['username'] == target_username:
@@ -367,28 +481,31 @@ async def create_dm(sid, data):
             break
 
     if not target_user_data:
-        await sio.emit('dm_error', {'message': 'User not found or offline'}, room=sid)
+        await sio.emit('dm_error', {'message': 'User not found'}, room=sid)
         return
 
-    # Create or find existing DM room
     async with AsyncSessionLocal() as db:
-        # Check if DM room already exists
-        existing_room = await db.execute(
+        # Buscar DM existente en ambas direcciones
+        from sqlalchemy import or_, and_
+
+        existing = await db.execute(
             select(Room).where(
-                Room.room_type == 'dm',
-                Room.name.in_([
-                    f"{current_user['username']}_{target_username}",
-                    f"{target_username}_{current_user['username']}"
-                ])
+                and_(
+                    Room.room_type == 'dm',
+                    or_(
+                        Room.name == f"{current_user['username']}_{target_username}",
+                        Room.name == f"{target_username}_{current_user['username']}"
+                    )
+                )
             )
         )
-        room = existing_room.scalar_one_or_none()
+        room = existing.scalar_one_or_none()
 
         if not room:
-            # Create new DM room
+            # Crear nueva
             room = Room(
                 name=f"{current_user['username']}_{target_username}",
-                description=f"DM between {current_user['username']} and {target_username}",
+                description=f"DM",
                 is_private=True,
                 room_type='dm',
                 created_by=current_user['user_id']
@@ -397,34 +514,24 @@ async def create_dm(sid, data):
             await db.commit()
             await db.refresh(room)
 
-            # Add both users as members
             for user_id in [current_user['user_id'], target_user_data['user_id']]:
-                membership = RoomMembership(
-                    user_id=user_id,
-                    room_id=room.id
-                )
+                membership = RoomMembership(user_id=user_id, room_id=room.id)
                 db.add(membership)
             await db.commit()
 
-    # Join both users to the DM room
     dm_room_name = f"dm_{room.id}"
     await sio.enter_room(sid, dm_room_name)
     await sio.enter_room(target_user_data['sid'], dm_room_name)
 
-    # Send DM room info to both users
     room_data = {
         'id': room.id,
         'name': room.name,
         'type': 'dm',
-        'with_user': target_username if sid == current_user['sid'] else current_user['username']
+        'with_user': target_username,
+        'with_user_id': target_user_data['user_id']
     }
 
     await sio.emit('dm_created', room_data, room=sid)
-    await sio.emit('dm_created', {
-        **room_data,
-        'with_user': current_user['username']
-    }, room=target_user_data['sid'])
-
 
 @sio.event
 async def send_dm(sid, data):
